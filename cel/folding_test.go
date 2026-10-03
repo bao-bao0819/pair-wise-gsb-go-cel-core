@@ -1342,7 +1342,9 @@ func TestConstantFoldingCallsWithSideEffects(t *testing.T) {
 			if iss.Err() != nil {
 				t.Fatalf("Compile() failed: %v", iss.Err())
 			}
-			folder, err := NewConstantFoldingOptimizer()
+			// Only the noSideEffect overload is declared pure, so it is the
+			// sole custom function which may execute during optimization.
+			folder, err := NewConstantFoldingOptimizer(PureFunctions("noSideEffect_int_int"))
 			if err != nil {
 				t.Fatalf("NewConstantFoldingOptimizer() failed: %v", err)
 			}
@@ -1363,6 +1365,198 @@ func TestConstantFoldingCallsWithSideEffects(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConstantFoldingPureFunctionPolicy(t *testing.T) {
+	counter := 0
+	e, err := NewEnv(
+		OptionalTypes(),
+		EnableMacroCallTracking(),
+		Function("track",
+			// Impure overload: reads and mutates state outside of the request.
+			Overload("track_int_int",
+				[]*Type{IntType},
+				IntType,
+				FunctionBinding(func(args ...ref.Val) ref.Val {
+					counter++
+					return args[0]
+				})),
+			// Pure overload sharing the same function name. Only this overload ID
+			// is declared safe to execute during optimization.
+			Overload("track_string_string",
+				[]*Type{StringType},
+				StringType,
+				FunctionBinding(func(args ...ref.Val) ref.Val {
+					return args[0]
+				}))),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+	tests := []struct {
+		expr   string
+		folded string
+	}{
+		{
+			// Impure custom overloads are not executed during optimization.
+			expr:   `track(1)`,
+			folded: `track(1)`,
+		},
+		{
+			// Pure overloads declared by overload ID are folded.
+			expr:   `track("a")`,
+			folded: `"a"`,
+		},
+		{
+			// Pure subexpressions within a non-foldable call still fold.
+			expr:   `track(1 + 2)`,
+			folded: `track(3)`,
+		},
+		{
+			// A non-foldable call prevents its parent call from folding.
+			expr:   `track(1) + 2`,
+			folded: `track(1) + 2`,
+		},
+		{
+			// Dead branch elimination does not invoke the impure call.
+			expr:   `false ? track(1) : 2`,
+			folded: `2`,
+		},
+		{
+			// The live impure branch is preserved, but not executed.
+			expr:   `true ? track(1) : 2`,
+			folded: `track(1)`,
+		},
+		{
+			// Pure comprehensions continue to fold.
+			expr:   `[1, 2].map(i, i + 1)`,
+			folded: `[2, 3]`,
+		},
+		{
+			// Comprehensions containing impure calls are not executed.
+			expr:   `[1, 2].map(i, track(i))`,
+			folded: `[1, 2].map(i, track(i))`,
+		},
+		{
+			// Nested comprehensions containing impure calls are not executed.
+			expr:   `[1, 2].map(i, [i].map(j, track(j)))`,
+			folded: `[1, 2].map(i, [i].map(j, track(j)))`,
+		},
+	}
+	for _, tst := range tests {
+		tc := tst
+		t.Run(tc.expr, func(t *testing.T) {
+			counter = 0
+			checked, iss := e.Compile(tc.expr)
+			if iss.Err() != nil {
+				t.Fatalf("Compile() failed: %v", iss.Err())
+			}
+			original, err := AstToString(checked)
+			if err != nil {
+				t.Fatalf("AstToString() failed: %v", err)
+			}
+			folder, err := NewConstantFoldingOptimizer(PureFunctions("track_string_string"))
+			if err != nil {
+				t.Fatalf("NewConstantFoldingOptimizer() failed: %v", err)
+			}
+			opt, err := NewStaticOptimizer(folder)
+			if err != nil {
+				t.Fatalf("NewStaticOptimizer() failed: %v", err)
+			}
+			optimized, iss := opt.Optimize(e, checked)
+			if iss.Err() != nil {
+				t.Fatalf("Optimize() generated an invalid AST: %v", iss.Err())
+			}
+			// Compilation must not execute the impure host function.
+			if counter != 0 {
+				t.Fatalf("Optimize() executed the impure function %d time(s)", counter)
+			}
+			folded, err := AstToString(optimized)
+			if err != nil {
+				t.Fatalf("AstToString() failed: %v", err)
+			}
+			if folded != tc.folded {
+				t.Errorf("got %q, wanted %q", folded, tc.folded)
+			}
+			// The input AST must not be modified by optimization.
+			if after := mustAstToString(t, checked); after != original {
+				t.Errorf("Optimize() mutated the input AST: got %q, wanted %q", after, original)
+			}
+			// Unchanged expressions retain their source positions.
+			if tc.folded == tc.expr {
+				if _, found := optimized.NativeRep().SourceInfo().GetOffsetRange(optimized.NativeRep().Expr().ID()); !found {
+					t.Errorf("optimized AST lost the source position of the root expression")
+				}
+			}
+			// Repeated optimization is stable and still does not execute impure calls.
+			reoptimized, iss := opt.Optimize(e, optimized)
+			if iss.Err() != nil {
+				t.Fatalf("repeated Optimize() generated an invalid AST: %v", iss.Err())
+			}
+			if counter != 0 {
+				t.Fatalf("repeated Optimize() executed the impure function %d time(s)", counter)
+			}
+			if refolded := mustAstToString(t, reoptimized); refolded != folded {
+				t.Errorf("repeated Optimize() got %q, wanted %q", refolded, folded)
+			}
+			// The optimized and original expressions are semantically equivalent, and
+			// only actual evaluation may execute the impure function.
+			wantOut := mustEval(t, e, checked)
+			gotOut := mustEval(t, e, optimized)
+			if gotOut.Equal(wantOut) != types.True {
+				t.Errorf("optimized eval got %v, wanted %v", gotOut, wantOut)
+			}
+		})
+	}
+	// Evaluation of the optimized impure call executes the host function exactly once.
+	counter = 0
+	checked, iss := e.Compile(`track(1)`)
+	if iss.Err() != nil {
+		t.Fatalf("Compile() failed: %v", iss.Err())
+	}
+	folder, err := NewConstantFoldingOptimizer(PureFunctions("track_string_string"))
+	if err != nil {
+		t.Fatalf("NewConstantFoldingOptimizer() failed: %v", err)
+	}
+	opt, err := NewStaticOptimizer(folder)
+	if err != nil {
+		t.Fatalf("NewStaticOptimizer() failed: %v", err)
+	}
+	optimized, iss := opt.Optimize(e, checked)
+	if iss.Err() != nil {
+		t.Fatalf("Optimize() generated an invalid AST: %v", iss.Err())
+	}
+	if counter != 0 {
+		t.Fatalf("Optimize() executed the impure function %d time(s)", counter)
+	}
+	if out := mustEval(t, e, optimized); out.Equal(types.Int(1)) != types.True {
+		t.Errorf("Eval() got %v, wanted 1", out)
+	}
+	if counter != 1 {
+		t.Errorf("Eval() executed the impure function %d time(s), wanted 1", counter)
+	}
+}
+
+func mustAstToString(t *testing.T, a *Ast) string {
+	t.Helper()
+	s, err := AstToString(a)
+	if err != nil {
+		t.Fatalf("AstToString() failed: %v", err)
+	}
+	return s
+}
+
+func mustEval(t *testing.T, e *Env, a *Ast) ref.Val {
+	t.Helper()
+	prg, err := e.Program(a)
+	if err != nil {
+		t.Fatalf("Program() failed: %v", err)
+	}
+	out, _, err := prg.Eval(NoVars())
+	if err != nil {
+		t.Fatalf("Eval() failed: %v", err)
+	}
+	return out
 }
 
 func TestConstantFoldingOptimizerMacroElimination(t *testing.T) {
