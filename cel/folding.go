@@ -18,10 +18,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/operators"
 	"cel.dev/cel-go/common/overloads"
+	"cel.dev/cel-go/common/stdlib"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
 	"cel.dev/cel-go/common/types/traits"
@@ -57,11 +59,34 @@ func FoldKnownValues(knownValues Activation) ConstantFoldingOption {
 	}
 }
 
+// FoldPureOverloads extends the set of function overloads which are permitted to execute
+// during constant folding with the specified custom overload ids.
+//
+// Host functions may read state external to the request or mutate shared state even when all
+// of their arguments are constant. To ensure such functions are not executed during the
+// optimization phase, the constant folder treats all function calls conservatively: the
+// built-in overloads provided by the CEL standard library are considered pure and continue
+// to be folded, whereas custom overloads are folded only when their resolved overload ids
+// are explicitly allow-listed through this option.
+//
+// Async and late-bound overloads are never folded, even when allow-listed. The purity policy
+// only affects optimization: a call which is not folded is retained in the AST and executes
+// normally during evaluation.
+func FoldPureOverloads(overloadIDs ...string) ConstantFoldingOption {
+	return func(opt *constantFoldingOptimizer) (*constantFoldingOptimizer, error) {
+		for _, id := range overloadIDs {
+			opt.pureOverloads[id] = struct{}{}
+		}
+		return opt, nil
+	}
+}
+
 // NewConstantFoldingOptimizer creates an optimizer which inlines constant scalar an aggregate
 // literal values within function calls and select statements with their evaluated result.
 func NewConstantFoldingOptimizer(opts ...ConstantFoldingOption) (ASTOptimizer, error) {
 	folder := &constantFoldingOptimizer{
 		maxFoldIterations: defaultMaxConstantFoldIterations,
+		pureOverloads:     map[string]struct{}{},
 	}
 	var err error
 	for _, o := range opts {
@@ -76,6 +101,13 @@ func NewConstantFoldingOptimizer(opts ...ConstantFoldingOption) (ASTOptimizer, e
 type constantFoldingOptimizer struct {
 	maxFoldIterations int
 	knownValues       Activation
+	// pureOverloads holds the custom overload ids which the user has declared safe to
+	// evaluate during optimization. The built-in standard library overloads are always
+	// considered pure and do not need to be listed here.
+	pureOverloads map[string]struct{}
+	// builtInPureOverloads caches the overload ids contributed by the core CEL libraries
+	// shipped with cel-go for a given optimization context.
+	builtInPureOverloads map[string]struct{}
 }
 
 // Optimize queries the expression graph for scalar and aggregate literal expressions within call and
@@ -95,11 +127,17 @@ func (opt *constantFoldingOptimizer) Optimize(ctx *OptimizerContext, a *ast.AST)
 		for _, fold := range foldableExprs {
 			// If the expression could be folded because it's a non-strict call, and the
 			// branches are pruned, continue to the next fold.
-			if fold.Kind() == ast.CallKind && maybePruneBranches(ctx, a, fold) {
+			if fold.Kind() == ast.CallKind && opt.maybePruneBranches(ctx, a, fold) {
 				continue
 			}
 			// Async and late-bound function calls cannot be folded.
 			if fold.Kind() == ast.CallKind && (isLateBoundFunctionCall(ctx, fold) || isAsyncFunctionCall(ctx, fold)) {
+				continue
+			}
+			// Defensive guard: only execute calls whose resolved overloads are known to be
+			// pure. The matcher should already have excluded these, but branch pruning and
+			// comprehension folding can surface calls with constant arguments directly.
+			if fold.Kind() == ast.CallKind && !opt.isFoldableCall(ctx, a, fold) {
 				continue
 			}
 			// Otherwise, assume all context is needed to evaluate the expression.
@@ -118,6 +156,11 @@ func (opt *constantFoldingOptimizer) Optimize(ctx *OptimizerContext, a *ast.AST)
 	// one last time. In this case, there's no guarantee they'll run, so we only update the
 	// target comprehension node with the literal value if the evaluation succeeds.
 	for _, compre := range ast.MatchDescendants(root, ast.KindMatcher(ast.ComprehensionKind)) {
+		// Comprehensions may invoke host functions through their loop step or condition; only
+		// fold them when every nested call is known to be pure.
+		if !opt.isFoldableExpr(ctx, a, compre) {
+			continue
+		}
 		opt.tryFold(ctx, a, compre)
 	}
 
@@ -208,16 +251,113 @@ func isAsyncFunctionCall(ctx *OptimizerContext, expr ast.Expr) bool {
 	return function.IsAsync()
 }
 
+// initBuiltInPureOverloads enumerates the overload ids contributed by the core CEL
+// libraries shipped with cel-go which are enabled in the optimization environment.
+//
+// The standard library overloads are collected directly, and the other core libraries
+// (currently the optional types library) are re-instantiated in isolation so that their
+// declarations can be inspected without depending on the library option wiring.
+func (opt *constantFoldingOptimizer) initBuiltInPureOverloads(ctx *OptimizerContext) {
+	if opt.builtInPureOverloads != nil {
+		return
+	}
+	opt.builtInPureOverloads = map[string]struct{}{}
+	for _, fn := range stdlib.Functions() {
+		for _, o := range fn.OverloadDecls() {
+			opt.builtInPureOverloads[o.ID()] = struct{}{}
+		}
+	}
+	for _, lib := range ctx.coreLibraries() {
+		libEnv, err := NewCustomEnv()
+		if err != nil {
+			continue
+		}
+		libEnv, err = Lib(lib)(libEnv)
+		if err != nil {
+			continue
+		}
+		for _, fn := range libEnv.Functions() {
+			for _, o := range fn.OverloadDecls() {
+				opt.builtInPureOverloads[o.ID()] = struct{}{}
+			}
+		}
+	}
+}
+
+// isPureOverload reports whether a single resolved overload id is permitted to execute
+// during folding: either it belongs to a core CEL library, or the user has explicitly
+// declared the custom overload pure via FoldPureOverloads.
+func (opt *constantFoldingOptimizer) isPureOverload(ctx *OptimizerContext, overloadID string) bool {
+	opt.initBuiltInPureOverloads(ctx)
+	if _, isBuiltIn := opt.builtInPureOverloads[overloadID]; isBuiltIn {
+		return true
+	}
+	_, allowed := opt.pureOverloads[overloadID]
+	return allowed
+}
+
+// isFoldableCall reports whether the resolved overload set for a call expression is known to
+// be pure according to the folding policy.
+//
+// Calls with no resolved overload information, ambiguous calls which include a non-pure
+// overload, and custom overloads which have not been explicitly allow-listed are rejected.
+func (opt *constantFoldingOptimizer) isFoldableCall(ctx *OptimizerContext, a *ast.AST, expr ast.Expr) bool {
+	if expr.Kind() != ast.CallKind {
+		return true
+	}
+	overloadIDs := a.GetOverloadIDs(expr.ID())
+	if len(overloadIDs) == 0 {
+		return false
+	}
+	for _, id := range overloadIDs {
+		if !opt.isPureOverload(ctx, id) {
+			return false
+		}
+	}
+	return true
+}
+
+// isFoldableExpr reports whether an expression subtree contains any call which is not
+// permitted to execute during folding.
+func (opt *constantFoldingOptimizer) isFoldableExpr(ctx *OptimizerContext, a *ast.AST, root ast.NavigableExpr) bool {
+	foldable := true
+	ast.PreOrderVisit(root, ast.NewExprVisitor(func(e ast.Expr) {
+		if !foldable {
+			return
+		}
+		if e.Kind() == ast.CallKind && !opt.isFoldableCall(ctx, a, e) {
+			foldable = false
+		}
+	}))
+	return foldable
+}
+
+// coreLibraries returns the built-in cel-go libraries (library names with the "cel.lib."
+// prefix) enabled in the optimization environment, excluding the standard library whose
+// overloads are collected separately.
+func (ctx *OptimizerContext) coreLibraries() []Library {
+	if ctx == nil || ctx.Env == nil {
+		return nil
+	}
+	var libs []Library
+	for name, lib := range ctx.Env.libraries {
+		if strings.HasPrefix(name, "cel.lib.") && name != "cel.lib.std" {
+			libs = append(libs, lib)
+		}
+	}
+	return libs
+}
+
 // maybePruneBranches inspects the non-strict call expression to determine whether
 // a branch can be removed. Evaluation will naturally prune logical and / or calls,
 // but conditional will not be pruned cleanly, so this is one small area where the
 // constant folding step reimplements a portion of the evaluator.
-func maybePruneBranches(ctx *OptimizerContext, a *ast.AST, expr ast.NavigableExpr) bool {
+func (opt *constantFoldingOptimizer) maybePruneBranches(ctx *OptimizerContext, a *ast.AST, expr ast.NavigableExpr) bool {
 	call := expr.AsCall()
 	args := call.Args()
 	switch call.FunctionName() {
 	case operators.LogicalAnd, operators.LogicalOr:
-		return maybeShortcircuitLogic(ctx, a, call.FunctionName(), args, expr)
+		return opt.maybeShortcircuitLogic(ctx, a, call.FunctionName(), args, expr)
 	case operators.Conditional:
 		cond := args[0]
 		truthy := args[1]
@@ -236,11 +376,21 @@ func maybePruneBranches(ctx *OptimizerContext, a *ast.AST, expr ast.NavigableExp
 	case operators.In:
 		haystack := args[1]
 		if isCollectionEmpty(haystack) {
+			// Folding `x in []` to `false` removes the runtime evaluation of `x`. Only do so
+			// when `x` cannot invoke a non-foldable host function.
+			if !opt.isFoldableExpr(ctx, a, args[0].(ast.NavigableExpr)) {
+				return false
+			}
 			ctx.UpdateExpr(expr, ctx.NewLiteral(types.False))
 			delete(a.ReferenceMap(), expr.ID())
 			return true
 		}
 		if collectionContainsNeedle(args[0], haystack) {
+			// Proving membership evaluates the needle, so ensure it does not invoke a
+			// non-foldable host function.
+			if !opt.isFoldableExpr(ctx, a, args[0].(ast.NavigableExpr)) {
+				return false
+			}
 			ctx.UpdateExpr(expr, ctx.NewLiteral(types.True))
 			delete(a.ReferenceMap(), expr.ID())
 			return true
@@ -270,7 +420,7 @@ func maybePruneBranches(ctx *OptimizerContext, a *ast.AST, expr ast.NavigableExp
 	return false
 }
 
-func maybeShortcircuitLogic(ctx *OptimizerContext, a *ast.AST, function string, args []ast.Expr, expr ast.NavigableExpr) bool {
+func (opt *constantFoldingOptimizer) maybeShortcircuitLogic(ctx *OptimizerContext, a *ast.AST, function string, args []ast.Expr, expr ast.NavigableExpr) bool {
 	shortcircuit := types.False
 	skip := types.True
 	if function == operators.LogicalOr {
@@ -575,7 +725,7 @@ func adaptLiteral(ctx *OptimizerContext, val ref.Val) (ast.Expr, error) {
 func (opt *constantFoldingOptimizer) constantExprMatcher(ctx *OptimizerContext, a *ast.AST, e ast.NavigableExpr) bool {
 	switch e.Kind() {
 	case ast.CallKind:
-		return constantCallMatcher(e)
+		return opt.constantCallMatcher(ctx, a, e)
 	case ast.SelectKind:
 		sel := e.AsSelect() // guaranteed to be a navigable value
 		return constantMatcher(sel.Operand().(ast.NavigableExpr))
@@ -599,8 +749,10 @@ func (opt *constantFoldingOptimizer) constantExprMatcher(ctx *OptimizerContext, 
 			if e.Kind() == ast.IdentKind && !vars[e.AsIdent()] {
 				constantExprs = false
 			}
-			// Async and late-bound function calls cannot be folded.
-			if e.Kind() == ast.CallKind && (isLateBoundFunctionCall(ctx, e) || isAsyncFunctionCall(ctx, e)) {
+			// Only calls known to be pure may execute within a folded comprehension:
+			// unknown, custom-undeclared, async, and late-bound functions are rejected.
+			if e.Kind() == ast.CallKind &&
+				(isLateBoundFunctionCall(ctx, e) || isAsyncFunctionCall(ctx, e) || !opt.isFoldableCall(ctx, a, e)) {
 				constantExprs = false
 			}
 		})
@@ -612,27 +764,30 @@ func (opt *constantFoldingOptimizer) constantExprMatcher(ctx *OptimizerContext, 
 }
 
 // constantCallMatcher identifies strict and non-strict calls which can be folded.
-func constantCallMatcher(e ast.NavigableExpr) bool {
+func (opt *constantFoldingOptimizer) constantCallMatcher(ctx *OptimizerContext, a *ast.AST, e ast.NavigableExpr) bool {
 	call := e.AsCall()
 	children := e.Children()
 	fnName := call.FunctionName()
 	if fnName == operators.LogicalAnd {
 		for _, child := range children {
-			if child.Kind() == ast.LiteralKind {
+			if child.Kind() == ast.LiteralKind && opt.isFoldableCall(ctx, a, e) {
 				return true
 			}
 		}
 	}
 	if fnName == operators.LogicalOr {
 		for _, child := range children {
-			if child.Kind() == ast.LiteralKind {
+			if child.Kind() == ast.LiteralKind && opt.isFoldableCall(ctx, a, e) {
 				return true
 			}
 		}
 	}
 	if fnName == operators.Conditional {
 		cond := children[0]
-		if cond.Kind() == ast.LiteralKind && cond.AsLiteral().Type() == types.BoolType {
+		if cond.Kind() == ast.LiteralKind && cond.AsLiteral().Type() == types.BoolType &&
+			// The conditional overload itself must be trusted pure; the dead branch is
+			// discarded and the surviving branch is matched independently.
+			opt.isFoldableCall(ctx, a, e) {
 			return true
 		}
 	}
@@ -640,7 +795,8 @@ func constantCallMatcher(e ast.NavigableExpr) bool {
 		if hasComprehensionVar(e) {
 			return false
 		}
-		if isExprConstantOfKind(children[0], types.BoolType) || isExprConstantOfKind(children[1], types.BoolType) {
+		if (isExprConstantOfKind(children[0], types.BoolType) || isExprConstantOfKind(children[1], types.BoolType)) &&
+			opt.isFoldableCall(ctx, a, e) {
 			return true
 		}
 	}
@@ -648,8 +804,12 @@ func constantCallMatcher(e ast.NavigableExpr) bool {
 		if hasComprehensionVar(e) {
 			return false
 		}
+		needle := children[0]
 		haystack := children[1]
-		if isCollectionEmpty(haystack) || collectionContainsNeedle(children[0], haystack) {
+		// Rewriting the membership test can skip evaluation of the needle at runtime, so
+		// require the needle to be free of non-foldable host function calls.
+		needleFoldable := opt.isFoldableExpr(ctx, a, needle.(ast.NavigableExpr))
+		if needleFoldable && (isCollectionEmpty(haystack) || collectionContainsNeedle(needle, haystack)) {
 			return true
 		}
 	}
@@ -659,6 +819,9 @@ func constantCallMatcher(e ast.NavigableExpr) bool {
 		}
 	}
 	// convert all other calls with constant arguments
+	if isLateBoundFunctionCall(ctx, e) || isAsyncFunctionCall(ctx, e) || !opt.isFoldableCall(ctx, a, e) {
+		return false
+	}
 	for _, child := range children {
 		if !constantMatcher(child) {
 			return false

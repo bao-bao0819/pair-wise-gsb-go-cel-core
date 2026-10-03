@@ -1280,12 +1280,18 @@ func TestConstantFoldingInListIdent(t *testing.T) {
 
 func TestConstantFoldingCallsWithSideEffects(t *testing.T) {
 	tests := []struct {
-		expr   string
-		folded string
+		expr        string
+		folded      string
+		allowPureID string
 	}{
 		{
 			expr:   `noSideEffect(3)`,
-			folded: `3`,
+			folded: `noSideEffect(3)`,
+		},
+		{
+			expr:        `noSideEffect(3)`,
+			folded:      `3`,
+			allowPureID: "noSideEffect_int_int",
 		},
 		{
 			expr:   `withSideEffect(3)`,
@@ -1297,7 +1303,12 @@ func TestConstantFoldingCallsWithSideEffects(t *testing.T) {
 		},
 		{
 			expr:   `[{}, {"a": 1}, {"b": 2}].exists(i, has(i.b) && noSideEffect(i.b) == 2)`,
-			folded: `true`,
+			folded: `[{}, {"a": 1}, {"b": 2}].exists(i, has(i.b) && noSideEffect(i.b) == 2)`,
+		},
+		{
+			expr:        `[{}, {"a": 1}, {"b": 2}].exists(i, has(i.b) && noSideEffect(i.b) == 2)`,
+			folded:      `true`,
+			allowPureID: "noSideEffect_int_int",
 		},
 		{
 			expr:   `noImpl(3)`,
@@ -1306,6 +1317,18 @@ func TestConstantFoldingCallsWithSideEffects(t *testing.T) {
 		{
 			expr:   `asyncFunc(3)`,
 			folded: `asyncFunc(3)`,
+		},
+		{
+			// Allow-listing an async overload does not make it foldable.
+			expr:        `asyncFunc(3)`,
+			folded:      `asyncFunc(3)`,
+			allowPureID: "asyncFunc_int_int",
+		},
+		{
+			// An unrelated allow-listed id does not grant folding to another overload.
+			expr:        `withSideEffect(3)`,
+			folded:      `withSideEffect(3)`,
+			allowPureID: "noSideEffect_int_int",
 		},
 	}
 	e, err := NewEnv(
@@ -1342,7 +1365,11 @@ func TestConstantFoldingCallsWithSideEffects(t *testing.T) {
 			if iss.Err() != nil {
 				t.Fatalf("Compile() failed: %v", iss.Err())
 			}
-			folder, err := NewConstantFoldingOptimizer()
+			var foldOpts []ConstantFoldingOption
+			if tc.allowPureID != "" {
+				foldOpts = append(foldOpts, FoldPureOverloads(tc.allowPureID))
+			}
+			folder, err := NewConstantFoldingOptimizer(foldOpts...)
 			if err != nil {
 				t.Fatalf("NewConstantFoldingOptimizer() failed: %v", err)
 			}
@@ -1363,6 +1390,293 @@ func TestConstantFoldingCallsWithSideEffects(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConstantFoldingFunctionPurityPolicy(t *testing.T) {
+	// counter() is a host function which mutates shared state outside of the request: each
+	// evaluation of the int overload increments a package-level counter. The same function
+	// name exposes a second uint overload which is pure. The purity policy is keyed by the
+	// resolved overload id, so allow-listing the pure uint overload must not enable folding
+	// of the stateful int overload.
+	var counter int64
+	e, err := NewEnv(
+		OptionalTypes(),
+		EnableMacroCallTracking(),
+		Variable("input", IntType),
+		Function("counter",
+			Overload("counter_stateful_int",
+				[]*Type{IntType},
+				IntType,
+				FunctionBinding(func(args ...ref.Val) ref.Val {
+					counter++
+					return args[0]
+				})),
+			Overload("counter_pure_uint",
+				[]*Type{UintType},
+				UintType,
+				FunctionBinding(func(args ...ref.Val) ref.Val {
+					return args[0]
+				}))),
+	)
+	if err != nil {
+		t.Fatalf("NewEnv() failed: %v", err)
+	}
+
+	// Compile the expressions up front so that compilation itself is proven not to invoke
+	// the stateful host function either.
+	type compiledCase struct {
+		name string
+		expr string
+		// input value supplied at evaluation time.
+		input int64
+		// number of times evaluation invokes the stateful int overload.
+		wantCount int64
+		// expected evaluation result.
+		want ref.Val
+		// expected unparsed output under the default folding policy.
+		defaultFolded string
+		// expected unparsed output when the pure overload is allow-listed.
+		pureFolded string
+	}
+	exprs := []compiledCase{
+		{
+			name:          "stateful call",
+			expr:          `counter(3)`,
+			wantCount:     1,
+			want:          types.Int(3),
+			defaultFolded: `counter(3)`,
+			pureFolded:    `counter(3)`,
+		},
+		{
+			name:          "pure overload call",
+			expr:          `counter(3u)`,
+			wantCount:     0,
+			want:          types.Uint(3),
+			defaultFolded: `counter(3u)`,
+			pureFolded:    `3u`,
+		},
+		{
+			name:          "dead truthy branch",
+			expr:          `true ? 1 : counter(3)`,
+			wantCount:     0,
+			want:          types.Int(1),
+			defaultFolded: `1`,
+			pureFolded:    `1`,
+		},
+		{
+			name:          "dead falsy branch",
+			expr:          `false ? counter(3) : 2`,
+			wantCount:     0,
+			want:          types.Int(2),
+			defaultFolded: `2`,
+			pureFolded:    `2`,
+		},
+		{
+			name:          "live branch",
+			expr:          `input > 0 ? counter(input) : 0`,
+			input:         7,
+			wantCount:     1,
+			want:          types.Int(7),
+			defaultFolded: `(input > 0) ? counter(input) : 0`,
+			pureFolded:    `(input > 0) ? counter(input) : 0`,
+		},
+		{
+			name:          "nested comprehension",
+			expr:          `[10, 20, 30].map(i, [i].filter(j, j > 0).map(k, counter(k)).size()).size() == 3`,
+			wantCount:     3,
+			want:          types.True,
+			defaultFolded: `[10, 20, 30].map(i, [i].filter(j, j > 0).map(k, counter(k)).size()).size() == 3`,
+			pureFolded:    `[10, 20, 30].map(i, [i].filter(j, j > 0).map(k, counter(k)).size()).size() == 3`,
+		},
+		{
+			name:          "comprehension guarded by logic",
+			expr:          `[1, 2].exists(i, i > 1 && counter(i) == 2)`,
+			wantCount:     1,
+			want:          types.True,
+			defaultFolded: `[1, 2].exists(i, i > 1 && counter(i) == 2)`,
+			pureFolded:    `[1, 2].exists(i, i > 1 && counter(i) == 2)`,
+		},
+		{
+			name:          "pure subexpression inside stateful call",
+			expr:          `counter(1 + 2) + (10 + 5)`,
+			wantCount:     1,
+			want:          types.Int(18),
+			defaultFolded: `counter(3) + 15`,
+			pureFolded:    `counter(3) + 15`,
+		},
+		{
+			name:          "stateful call dropped from membership",
+			expr:          `counter(1) in []`,
+			wantCount:     1,
+			want:          types.False,
+			defaultFolded: `counter(1) in []`,
+			pureFolded:    `counter(1) in []`,
+		},
+		{
+			// Branch pruning must select the live branch without executing it, even when
+			// both branches host stateful calls.
+			name:          "stateful branches both sides",
+			expr:          `false ? counter(3) : counter(4)`,
+			wantCount:     1,
+			want:          types.Int(4),
+			defaultFolded: `counter(4)`,
+			pureFolded:    `counter(4)`,
+		},
+		{
+			// A stateful call nested inside built-in arithmetic is not folded itself, but
+			// its pure constant arguments still are.
+			name:          "stateful call nested in arithmetic",
+			expr:          `2 * counter(1 + 2)`,
+			wantCount:     1,
+			want:          types.Int(6),
+			defaultFolded: `2 * counter(3)`,
+			pureFolded:    `2 * counter(3)`,
+		},
+		{
+			// The pure uint overload only folds once it is allow-listed, including when it
+			// appears inside a dead branch which gets pruned.
+			name:          "pure overload in dead branch",
+			expr:          `true ? counter(5u) : 0u`,
+			wantCount:     0,
+			want:          types.Uint(5),
+			defaultFolded: `counter(5u)`,
+			pureFolded:    `5u`,
+		},
+	}
+
+	checked := make([]*Ast, len(exprs))
+	for i, tc := range exprs {
+		ast, iss := e.Compile(tc.expr)
+		if iss.Err() != nil {
+			t.Fatalf("%s: Compile() failed: %v", tc.name, iss.Err())
+		}
+		checked[i] = ast
+	}
+	if counter != 0 {
+		t.Fatalf("parsing/type-checking invoked the host function %d times, wanted 0", counter)
+	}
+
+	// Default policy: no custom overload is allowed to execute during folding.
+	defaultFolder, err := NewConstantFoldingOptimizer()
+	if err != nil {
+		t.Fatalf("NewConstantFoldingOptimizer() failed: %v", err)
+	}
+	defaultOptimizer, err := NewStaticOptimizer(defaultFolder)
+	if err != nil {
+		t.Fatalf("NewStaticOptimizer() failed: %v", err)
+	}
+
+	// Policy which explicitly allows only the pure uint overload. The stateful int overload
+	// must remain untouched.
+	pureFolder, err := NewConstantFoldingOptimizer(FoldPureOverloads("counter_pure_uint"))
+	if err != nil {
+		t.Fatalf("NewConstantFoldingOptimizer(pure) failed: %v", err)
+	}
+	pureOptimizer, err := NewStaticOptimizer(pureFolder)
+	if err != nil {
+		t.Fatalf("NewStaticOptimizer(pure) failed: %v", err)
+	}
+
+	optimize := func(t *testing.T, tc compiledCase, ast *Ast, optimizer *StaticOptimizer) *Ast {
+		t.Helper()
+		before := counter
+		out, iss := optimizer.Optimize(e, ast)
+		if iss.Err() != nil {
+			t.Fatalf("%s: Optimize() generated an invalid AST: %v", tc.name, iss.Err())
+		}
+		if counter != before {
+			t.Fatalf("%s: optimization invoked the stateful host function (counter %d -> %d)", tc.name, before, counter)
+		}
+		return out
+	}
+
+	for i, tc := range exprs {
+		tc := tc
+		checkPolicy := func(t *testing.T, optimizer *StaticOptimizer, expectedFolded string) {
+			t.Helper()
+			// Snapshot the original AST representation so that immutability can be verified
+			// after optimization.
+			originalUnparsed, err := AstToString(checked[i])
+			if err != nil {
+				t.Fatalf("AstToString(original) failed: %v", err)
+			}
+			optimized := optimize(t, tc, checked[i], optimizer)
+
+			// Optimizing the already-optimized AST a second time must be a semantic no-op and
+			// must not invoke the stateful function either.
+			optimizedTwice := optimize(t, tc, optimized, optimizer)
+
+			unparsed, err := AstToString(optimized)
+			if err != nil {
+				t.Fatalf("AstToString() failed: %v", err)
+			}
+			if unparsed != expectedFolded {
+				t.Errorf("folded to %q, wanted %q", unparsed, expectedFolded)
+			}
+			twiceUnparsed, err := AstToString(optimizedTwice)
+			if err != nil {
+				t.Fatalf("AstToString(twice) failed: %v", err)
+			}
+			if twiceUnparsed != unparsed {
+				t.Errorf("repeated optimization changed the AST: %q -> %q", unparsed, twiceUnparsed)
+			}
+
+			// The original AST must be untouched by optimization.
+			stillOriginal, err := AstToString(checked[i])
+			if err != nil {
+				t.Fatalf("AstToString(original) failed: %v", err)
+			}
+			if stillOriginal != originalUnparsed {
+				t.Errorf("original AST was modified: %q -> %q", originalUnparsed, stillOriginal)
+			}
+
+			// The optimized AST must evaluate to the same result and trigger the stateful
+			// overload exactly as many times as the original.
+			before := counter
+			origVal := evalPurityCase(t, e, checked[i], tc.input)
+			origCount := counter - before
+
+			before = counter
+			optVal := evalPurityCase(t, e, optimized, tc.input)
+			optCount := counter - before
+
+			before = counter
+			twiceVal := evalPurityCase(t, e, optimizedTwice, tc.input)
+			twiceCount := counter - before
+
+			if !reflect.DeepEqual(origVal, tc.want) {
+				t.Errorf("original eval got %v, wanted %v", origVal, tc.want)
+			}
+			if !reflect.DeepEqual(optVal, origVal) || !reflect.DeepEqual(twiceVal, origVal) {
+				t.Errorf("semantic mismatch: original=%v optimized=%v twice=%v", origVal, optVal, twiceVal)
+			}
+			if optCount != origCount || twiceCount != origCount {
+				t.Errorf("side-effect count mismatch: original=%d optimized=%d twice=%d", origCount, optCount, twiceCount)
+			}
+			if origCount != tc.wantCount {
+				t.Errorf("test setup error: %s triggered the stateful overload %d times, wanted %d", tc.name, origCount, tc.wantCount)
+			}
+		}
+		t.Run(tc.name+"/default", func(t *testing.T) {
+			checkPolicy(t, defaultOptimizer, tc.defaultFolded)
+		})
+		t.Run(tc.name+"/pure-allowlist", func(t *testing.T) {
+			checkPolicy(t, pureOptimizer, tc.pureFolded)
+		})
+	}
+}
+
+func evalPurityCase(t *testing.T, e *Env, ast *Ast, input int64) ref.Val {
+	t.Helper()
+	prg, err := e.Program(ast)
+	if err != nil {
+		t.Fatalf("Program() failed: %v", err)
+	}
+	out, _, err := prg.Eval(map[string]any{"input": input})
+	if err != nil {
+		t.Fatalf("Eval() failed: %v", err)
+	}
+	return out
 }
 
 func TestConstantFoldingOptimizerMacroElimination(t *testing.T) {
@@ -1980,8 +2294,8 @@ func (u *unadaptableVal) ConvertToType(typeVal ref.Type) ref.Val {
 	return types.NewErr("cannot convert")
 }
 func (u *unadaptableVal) Equal(other ref.Val) ref.Val { return types.False }
-func (u *unadaptableVal) Type() ref.Type             { return u.valType }
-func (u *unadaptableVal) Value() any                 { return u }
+func (u *unadaptableVal) Type() ref.Type              { return u.valType }
+func (u *unadaptableVal) Value() any                  { return u }
 
 func TestAdaptLiteral(t *testing.T) {
 	env, err := NewEnv(
