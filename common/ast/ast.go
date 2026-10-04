@@ -256,6 +256,36 @@ func CopySourceInfo(info *SourceInfo) *SourceInfo {
 	}
 }
 
+// NewMergedSourceInfo creates a fresh SourceInfo by layering additional offset ranges and macro
+// call metadata on top of a copy of the base SourceInfo.
+//
+// The base SourceInfo is copied and is not modified. The extra offsets and macro calls are folded
+// in as-is: callers are responsible for ensuring that the ids referenced by the extra values do
+// not collide with the ids used by the base metadata and that any offset values have already been
+// translated into the coordinate space of the merged source. The lineOffsets, if non-nil, describe
+// the coordinate space of the merged content; otherwise the base line offsets are retained.
+//
+// Extensions from the base and the extra metadata are unioned.
+func NewMergedSourceInfo(base *SourceInfo, lineOffsets []int32, extraRanges map[int64]OffsetRange, extraMacroCalls map[int64]Expr) *SourceInfo {
+	merged := CopySourceInfo(base)
+	if merged == nil {
+		merged = &SourceInfo{
+			offsetRanges: make(map[int64]OffsetRange),
+			macroCalls:   make(map[int64]Expr),
+		}
+	}
+	if lineOffsets != nil {
+		merged.lines = lineOffsets
+	}
+	for id, r := range extraRanges {
+		merged.offsetRanges[id] = r
+	}
+	for id, call := range extraMacroCalls {
+		merged.macroCalls[id] = call
+	}
+	return merged
+}
+
 // SourceInfo records basic information about the expression as a textual input and
 // as a parsed expression value.
 type SourceInfo struct {
