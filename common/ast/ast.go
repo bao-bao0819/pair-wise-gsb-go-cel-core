@@ -224,6 +224,23 @@ func NewSourceInfo(src common.Source) *SourceInfo {
 	}
 }
 
+// NewMergedSourceInfo creates a SourceInfo value from pre-computed metadata.
+//
+// This is intended for AST rewrites, such as expression substitution, which combine source
+// information from more than one input source: the caller is responsible for supplying line
+// offsets and offset ranges expressed in a single shared coordinate system. Nodes whose
+// positions are unknown may omit them from offsetRanges.
+func NewMergedSourceInfo(desc string, lines []int32, baseLine, baseCol int32) *SourceInfo {
+	return &SourceInfo{
+		desc:         desc,
+		lines:        slices.Clone(lines),
+		baseLine:     baseLine,
+		baseCol:      baseCol,
+		offsetRanges: make(map[int64]OffsetRange),
+		macroCalls:   make(map[int64]Expr),
+	}
+}
+
 // CopySourceInfo creates a deep copy of the MacroCalls within the input SourceInfo.
 //
 // Copies of macro Expr values are generated using an internal default ExprFactory.
