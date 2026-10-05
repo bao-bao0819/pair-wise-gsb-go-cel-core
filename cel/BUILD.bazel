@@ -9,6 +9,7 @@ go_library(
     srcs = [
         "cel.go",
         "decls.go",
+        "dependency_contract.go",
         "env.go",
         "fieldpaths.go",
         "folding.go",
@@ -67,6 +68,7 @@ go_test(
         "cel_test.go",
         "cost_test.go",
         "cost_k8s_test.go",
+        "dependency_contract_test.go",
         "decls_test.go",
         "env_ext_test.go",
         "env_test.go",

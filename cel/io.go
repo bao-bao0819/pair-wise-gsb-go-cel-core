@@ -60,6 +60,16 @@ func CheckedExprToAstWithSource(checkedExpr *exprpb.CheckedExpr, src Source) (*A
 	return out, nil
 }
 
+// CheckedExprToAstWithDependencyContract converts a checked expression proto message to an Ast
+// and attaches a separately serialized dependency contract for target-Env compatibility checks.
+func CheckedExprToAstWithDependencyContract(checkedExpr *exprpb.CheckedExpr, contract *DependencyContract, src Source) (*Ast, error) {
+	a, err := CheckedExprToAstWithSource(checkedExpr, src)
+	if err != nil {
+		return nil, err
+	}
+	return WithDependencyContract(a, contract)
+}
+
 // AstToCheckedExpr converts an Ast to an protobuf CheckedExpr value.
 //
 // If the Ast.IsChecked() returns false, this conversion method will return an error.

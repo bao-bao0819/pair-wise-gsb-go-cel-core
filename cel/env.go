@@ -48,8 +48,9 @@ type Source = common.Source
 // Ast representing the checked or unchecked expression, its source, and related metadata such as
 // source position information.
 type Ast struct {
-	source Source
-	impl   *celast.AST
+	source   Source
+	impl     *celast.AST
+	contract *DependencyContract
 	// loadErr captures an error detected while loading the AST (e.g. an over-deep AST ingested via
 	// ParsedExprToAst / CheckedExprToAst) so it can be surfaced when the Ast is checked or planned
 	// instead of recursing into the checker or planner on adversarially deep input.
@@ -79,6 +80,14 @@ func (ast *Ast) Expr() *exprpb.Expr {
 // IsChecked returns whether the Ast value has been successfully type-checked.
 func (ast *Ast) IsChecked() bool {
 	return ast.NativeRep().IsChecked()
+}
+
+// DependencyContract returns the checked-AST dependency contract attached to the Ast, if one exists.
+func (ast *Ast) DependencyContract() *DependencyContract {
+	if ast == nil {
+		return nil
+	}
+	return ast.contract
 }
 
 // SourceInfo returns character offset and newline position information about expression elements.
@@ -825,6 +834,14 @@ func (e *Env) Program(ast *Ast, opts ...ProgramOption) (Program, error) {
 	// cheap field read; the depth traversal itself runs once at conversion time, not here.
 	if ast != nil && ast.loadErr != nil {
 		return nil, ast.loadErr
+	}
+	if ast != nil && ast.contract != nil {
+		if !ast.IsChecked() {
+			return nil, fmt.Errorf("dependency contract requires a checked ast")
+		}
+		if err := ast.contract.CheckCompatibility(e); err != nil {
+			return nil, err
+		}
 	}
 	return e.PlanProgram(ast.NativeRep(), opts...)
 }
