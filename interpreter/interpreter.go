@@ -184,6 +184,16 @@ func CustomDecoratorV2(dec InterpretableDecoratorV2) PlannerOption {
 	}
 }
 
+// LateDecoratorV2 configures a custom V2 interpretable decorator which is applied after all
+// other decorators, outermost-first. This is used by features which need to observe the final
+// form of each planned node (e.g. after exhaustive-eval or optimization substitutions).
+func LateDecoratorV2(dec InterpretableDecoratorV2) PlannerOption {
+	return func(p *planner) (*planner, error) {
+		p.lateDecorators = append(p.lateDecorators, dec)
+		return p, nil
+	}
+}
+
 // ExhaustiveEval replaces operations that short-circuit with versions that evaluate
 // expressions and couples this behavior with the TrackState() decorator to provide
 // insight into the evaluation state of the entire expression. EvalState must be

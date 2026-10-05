@@ -95,6 +95,11 @@ type ExecutionFrame struct {
 
 	// costTracker provides direct access to the active CostTracker for this evaluation pass.
 	costTracker *CostTracker
+
+	// labels carries the per-evaluation data label tracking state. It is non-nil only when the
+	// program was planned with label tracking enabled. Child comprehension frames inherit the
+	// value from their parent so that the state is scoped to a single evaluation pass.
+	labels *labelEvalState
 }
 
 // Scope returns the local activation scope for this frame, if present.
@@ -198,6 +203,7 @@ func (f *ExecutionFrame) Close() {
 	f.parent = nil
 	f.costTracker = nil
 	f.functions = nil
+	f.labels = nil
 	if f.vars != nil {
 		f.vars = nil
 		clear(f.lazyVars)
@@ -219,6 +225,7 @@ func (f *ExecutionFrame) Push(activation Activation) *ExecutionFrame {
 	// Scopes pushed during evaluation never supply late-bound functions, so the child inherits
 	// the bindings resolved for the evaluation rather than searching its own hierarchy.
 	child.functions = f.functions
+	child.labels = f.labels
 	return child
 }
 
@@ -233,6 +240,7 @@ func (f *ExecutionFrame) Pop() *ExecutionFrame {
 	f.functions = nil
 	f.ctx = nil
 	f.costTracker = nil
+	f.labels = nil
 	if f.vars != nil {
 		f.vars = nil
 		clear(f.lazyVars)
@@ -375,6 +383,18 @@ func (f *ExecutionFrame) CostTracker() *CostTracker {
 		return nil
 	}
 	return f.costTracker
+}
+
+// labelState returns the per-evaluation data label state for the frame, if label tracking was
+// enabled for the program. Child comprehension frames report the shared state of their root
+// evaluation frame.
+func (f *ExecutionFrame) labelState() *labelEvalState {
+	for cur := f; cur != nil; cur = cur.parent {
+		if cur.labels != nil {
+			return cur.labels
+		}
+	}
+	return nil
 }
 
 // SetCostTracker sets the active CostTracker for this evaluation pass.

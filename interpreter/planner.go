@@ -51,14 +51,20 @@ func newPlanner(disp Dispatcher,
 
 // planner is an implementation of the interpretablePlanner interface.
 type planner struct {
-	disp               Dispatcher
-	provider           types.Provider
-	adapter            types.Adapter
-	attrFactory        AttributeFactory
-	container          *containers.Container
-	refMap             map[int64]*ast.ReferenceInfo
-	typeMap            map[int64]*types.Type
-	decorators         []InterpretableDecoratorV2
+	disp        Dispatcher
+	provider    types.Provider
+	adapter     types.Adapter
+	attrFactory AttributeFactory
+	container   *containers.Container
+	refMap      map[int64]*ast.ReferenceInfo
+	typeMap     map[int64]*types.Type
+	decorators  []InterpretableDecoratorV2
+	// lateDecorators are applied after every other decorator, outermost-first, so that they
+	// observe the final planned node form (e.g. exhaustive or optimized replacements).
+	lateDecorators []InterpretableDecoratorV2
+	// rootWrapper optionally replaces the fully planned root node, e.g. to install
+	// per-evaluation tracking state.
+	rootWrapper        func(InterpretableV2) InterpretableV2
 	observers          []StatefulObserver
 	costTrackerFactory func() (*CostTracker, error)
 }
@@ -81,10 +87,15 @@ func (p *planner) Plan(expr ast.Expr) (InterpretableV2, error) {
 		// leave it alone, silently dropping the second observer's observations.
 		p.decorators = append(p.decorators, decObserveEval(observeAll(p.observers)))
 	}
+	// Late decorators run last, and therefore wrap every other planned/decorated node.
+	p.decorators = append(p.decorators, p.lateDecorators...)
 	pb := &planBuilder{planner: p, localVars: make(map[string]int)}
 	i, err := pb.plan(expr)
 	if err != nil {
 		return nil, err
+	}
+	if p.rootWrapper != nil {
+		i = p.rootWrapper(i)
 	}
 	if p.costTrackerFactory != nil {
 		i = &costTrackingInterpretable{InterpretableV2: i, factory: p.costTrackerFactory}

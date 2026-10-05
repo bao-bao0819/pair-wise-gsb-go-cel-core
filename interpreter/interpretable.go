@@ -582,6 +582,7 @@ type evalZeroArity struct {
 	function string
 	overload string
 	impl     functions.FunctionOp
+	preCall  func(frame *ExecutionFrame, function, overload string, args []ref.Val) ref.Val
 }
 
 // ID implements the Interpretable interface method.
@@ -591,6 +592,11 @@ func (zero *evalZeroArity) ID() int64 {
 
 // Exec implements the InterpretableV2 interface method.
 func (zero *evalZeroArity) Exec(frame *ExecutionFrame) ref.Val {
+	if zero.preCall != nil {
+		if denied := zero.preCall(frame, zero.function, zero.overload, nil); denied != nil {
+			return denied
+		}
+	}
 	res := labelErrNode(zero.id, zero.impl())
 	if costs := frame.CostTracker(); costs != nil {
 		costs.EvalZeroArity(frame, zero.id, zero, res)
@@ -626,6 +632,7 @@ type evalUnary struct {
 	trait     int
 	impl      functions.UnaryOp
 	nonStrict bool
+	preCall   func(frame *ExecutionFrame, function, overload string, args []ref.Val) ref.Val
 }
 
 // ID implements the Interpretable interface method.
@@ -660,8 +667,18 @@ func (un *evalUnary) Exec(frame *ExecutionFrame) ref.Val {
 	// If the implementation is bound and the argument value has the right traits required to
 	// invoke it, then call the implementation.
 	if un.impl != nil && (un.trait == 0 || matchOperandTrait(un.trait, strict, argVal)) {
+		if un.preCall != nil {
+			if denied := un.preCall(frame, un.function, un.overload, []ref.Val{argVal}); denied != nil {
+				return denied
+			}
+		}
 		res = labelErrNode(un.id, un.impl(argVal))
 	} else if argVal.Type().HasTrait(traits.ReceiverType) {
+		if un.preCall != nil {
+			if denied := un.preCall(frame, un.function, un.overload, []ref.Val{argVal}); denied != nil {
+				return denied
+			}
+		}
 		// Otherwise, if the argument is a ReceiverType attempt to invoke the receiver method on the
 		// operand (arg0).
 		res = labelErrNode(un.id, argVal.(traits.Receiver).Receive(un.function, un.overload, []ref.Val{}))
@@ -703,6 +720,7 @@ type evalBinary struct {
 	trait     int
 	impl      functions.BinaryOp
 	nonStrict bool
+	preCall   func(frame *ExecutionFrame, function, overload string, args []ref.Val) ref.Val
 }
 
 // ID implements the Interpretable interface method.
@@ -749,8 +767,18 @@ func (bin *evalBinary) Exec(frame *ExecutionFrame) ref.Val {
 	// If the implementation is bound and the argument value has the right traits required to
 	// invoke it, then call the implementation.
 	if bin.impl != nil && (bin.trait == 0 || matchOperandTrait(bin.trait, strict, lVal)) {
+		if bin.preCall != nil {
+			if denied := bin.preCall(frame, bin.function, bin.overload, []ref.Val{lVal, rVal}); denied != nil {
+				return denied
+			}
+		}
 		res = labelErrNode(bin.id, bin.impl(lVal, rVal))
 	} else if lVal.Type().HasTrait(traits.ReceiverType) {
+		if bin.preCall != nil {
+			if denied := bin.preCall(frame, bin.function, bin.overload, []ref.Val{lVal, rVal}); denied != nil {
+				return denied
+			}
+		}
 		// Otherwise, if the argument is a ReceiverType attempt to invoke the receiver method on the
 		// operand (arg0).
 		res = labelErrNode(bin.id, lVal.(traits.Receiver).Receive(bin.function, bin.overload, []ref.Val{rVal}))
@@ -791,6 +819,7 @@ type evalVarArgs struct {
 	trait     int
 	impl      functions.FunctionOp
 	nonStrict bool
+	preCall   func(frame *ExecutionFrame, function, overload string, args []ref.Val) ref.Val
 }
 
 // NewCall creates a new call Interpretable.
@@ -837,6 +866,11 @@ func (fn *evalVarArgs) Exec(frame *ExecutionFrame) ref.Val {
 		return unk
 	}
 	if len(argVals) == 0 {
+		if fn.preCall != nil {
+			if denied := fn.preCall(frame, fn.function, fn.overload, nil); denied != nil {
+				return denied
+			}
+		}
 		var res ref.Val
 		if fn.impl != nil {
 			res = labelErrNode(fn.id, fn.impl())
@@ -853,8 +887,18 @@ func (fn *evalVarArgs) Exec(frame *ExecutionFrame) ref.Val {
 	// invoke it, then call the implementation.
 	arg0 := argVals[0]
 	if fn.impl != nil && matchOperandTrait(fn.trait, strict, arg0) {
+		if fn.preCall != nil {
+			if denied := fn.preCall(frame, fn.function, fn.overload, argVals); denied != nil {
+				return denied
+			}
+		}
 		res = labelErrNode(fn.id, fn.impl(argVals...))
 	} else if arg0.Type().HasTrait(traits.ReceiverType) {
+		if fn.preCall != nil {
+			if denied := fn.preCall(frame, fn.function, fn.overload, argVals); denied != nil {
+				return denied
+			}
+		}
 		// Otherwise, if the argument is a ReceiverType attempt to invoke the receiver method on the
 		// operand (arg0).
 		res = labelErrNode(fn.id, arg0.(traits.Receiver).Receive(fn.function, fn.overload, argVals[1:]))
@@ -898,6 +942,7 @@ type evalLateBoundFunc struct {
 	nonStrict bool
 	member    bool
 	dispatch  functions.LateBoundDispatcher
+	preCall   func(frame *ExecutionFrame, function, overload string, args []ref.Val) ref.Val
 }
 
 // ID implements the Interpretable interface method.
@@ -952,7 +997,16 @@ func (fn *evalLateBoundFunc) Exec(frame *ExecutionFrame) ref.Val {
 	// declaration promised a binding supplied at evaluation time, so a missing or mismatched
 	// binding is unambiguously an error.
 	if lateFn, found := fn.resolve(frame, argVals, strict); found {
-		res = types.LabelErrNode(fn.id, lateFn(argVals...))
+		if fn.preCall != nil {
+			overloadID, _ := fn.matchOverload(argVals, strict)
+			if denied := fn.preCall(frame, fn.function, overloadID, argVals); denied != nil {
+				res = denied
+			} else {
+				res = types.LabelErrNode(fn.id, lateFn(argVals...))
+			}
+		} else {
+			res = types.LabelErrNode(fn.id, lateFn(argVals...))
+		}
 	} else {
 		res = types.NewErrWithNodeID(fn.id, "no such overload: %s", fn.function)
 	}
