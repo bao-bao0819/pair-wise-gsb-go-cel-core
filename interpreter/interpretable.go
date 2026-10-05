@@ -222,6 +222,9 @@ func EvalActivation(ctx Activation, exec func(*ExecutionFrame) ref.Val) ref.Val 
 // findFrame walks the activation hierarchy via Unwrap and Parent to locate an
 // existing ExecutionFrame, if one exists.
 func findFrame(a Activation) *ExecutionFrame {
+	if a == nil {
+		return nil
+	}
 	if wrapper, ok := a.(activationWrapper); ok {
 		unwrapped := wrapper.Unwrap()
 		if f, ok := unwrapped.(*ExecutionFrame); ok {
@@ -591,6 +594,9 @@ func (zero *evalZeroArity) ID() int64 {
 
 // Exec implements the InterpretableV2 interface method.
 func (zero *evalZeroArity) Exec(frame *ExecutionFrame) ref.Val {
+	if gateErr := gateLabels(frame, zero.id, zero.function, zero.overload, nil, nil); gateErr != nil {
+		return gateErr
+	}
 	res := labelErrNode(zero.id, zero.impl())
 	if costs := frame.CostTracker(); costs != nil {
 		costs.EvalZeroArity(frame, zero.id, zero, res)
@@ -659,6 +665,9 @@ func (un *evalUnary) Exec(frame *ExecutionFrame) ref.Val {
 	var res ref.Val
 	// If the implementation is bound and the argument value has the right traits required to
 	// invoke it, then call the implementation.
+	if gateErr := gateLabels(frame, un.id, un.function, un.overload, []ref.Val{argVal}, []InterpretableV2{un.arg}); gateErr != nil {
+		return gateErr
+	}
 	if un.impl != nil && (un.trait == 0 || matchOperandTrait(un.trait, strict, argVal)) {
 		res = labelErrNode(un.id, un.impl(argVal))
 	} else if argVal.Type().HasTrait(traits.ReceiverType) {
@@ -748,6 +757,9 @@ func (bin *evalBinary) Exec(frame *ExecutionFrame) ref.Val {
 	var res ref.Val
 	// If the implementation is bound and the argument value has the right traits required to
 	// invoke it, then call the implementation.
+	if gateErr := gateLabels(frame, bin.id, bin.function, bin.overload, []ref.Val{lVal, rVal}, []InterpretableV2{bin.lhs, bin.rhs}); gateErr != nil {
+		return gateErr
+	}
 	if bin.impl != nil && (bin.trait == 0 || matchOperandTrait(bin.trait, strict, lVal)) {
 		res = labelErrNode(bin.id, bin.impl(lVal, rVal))
 	} else if lVal.Type().HasTrait(traits.ReceiverType) {
@@ -852,6 +864,9 @@ func (fn *evalVarArgs) Exec(frame *ExecutionFrame) ref.Val {
 	// If the implementation is bound and the argument value has the right traits required to
 	// invoke it, then call the implementation.
 	arg0 := argVals[0]
+	if gateErr := gateLabels(frame, fn.id, fn.function, fn.overload, argVals, fn.args); gateErr != nil {
+		return gateErr
+	}
 	if fn.impl != nil && matchOperandTrait(fn.trait, strict, arg0) {
 		res = labelErrNode(fn.id, fn.impl(argVals...))
 	} else if arg0.Type().HasTrait(traits.ReceiverType) {
@@ -952,6 +967,10 @@ func (fn *evalLateBoundFunc) Exec(frame *ExecutionFrame) ref.Val {
 	// declaration promised a binding supplied at evaluation time, so a missing or mismatched
 	// binding is unambiguously an error.
 	if lateFn, found := fn.resolve(frame, argVals, strict); found {
+		overloadID, _ := fn.matchOverload(argVals, strict)
+		if gateErr := gateLabels(frame, fn.id, fn.function, overloadID, argVals, fn.args); gateErr != nil {
+			return gateErr
+		}
 		res = types.LabelErrNode(fn.id, lateFn(argVals...))
 	} else {
 		res = types.NewErrWithNodeID(fn.id, "no such overload: %s", fn.function)
@@ -1974,12 +1993,19 @@ type folder struct {
 	interrupted   bool
 	computeResult bool
 	listV1Fold    bool
+
+	// labels optionally tracks per-iteration data labels for comprehension variables. When
+	// nil, the folder follows its original (non-labeled) evaluation behavior.
+	labels *labelTracker
 }
 
 func (f *folder) foldIterable(iterable traits.Iterable) ref.Val {
 	it := iterable.Iterator()
 	for it.HasNext() == types.True {
 		f.iterVar1Val = it.Next()
+		if f.labels != nil {
+			f.labels.setLocal(f.iterVar, f.labels.node(f.iterRange.ID()))
+		}
 
 		cond := f.cond.Exec(f.frame)
 		if f.interrupted {
@@ -2018,6 +2044,14 @@ func (f *folder) FoldEntry(key, val any) bool {
 		f.iterVar1Val = key
 		f.iterVar2Val = val
 	}
+	if f.labels != nil {
+		if f.iterVar != "" {
+			f.labels.setLocal(f.iterVar, f.labels.node(f.iterRange.ID()))
+		}
+		if f.iterVar2 != "" {
+			f.labels.setLocal(f.iterVar2, f.labels.node(f.iterRange.ID()))
+		}
+	}
 
 	// Terminate evaluation if evaluation is interrupted or the condition is not true and exhaustive
 	// eval is not enabled.
@@ -2034,6 +2068,9 @@ func (f *folder) FoldEntry(key, val any) bool {
 
 	// Update the accumulation value and check for eval interruption.
 	f.accuVal = f.step.Exec(f.frame)
+	if f.labels != nil {
+		f.labels.setLocal(f.accuVar, f.labels.node(f.step.ID()))
+	}
 	f.initialized = true
 	if f.interruptable && f.frame.CheckInterrupt() {
 		f.interrupted = true
@@ -2061,6 +2098,9 @@ func (f *folder) ResolveName(name string) (any, bool) {
 				}
 			}
 			f.accuVal = initVal
+			if f.labels != nil {
+				f.labels.setLocal(f.accuVar, f.labels.node(f.accu.ID()))
+			}
 		}
 		return f.accuVal, true
 	}
@@ -2155,6 +2195,7 @@ func (f *folder) reset() {
 	f.interrupted = false
 	f.computeResult = false
 	f.listV1Fold = false
+	f.labels = nil
 }
 
 // InterruptError is a specialized error type used to signal that program evaluation should check

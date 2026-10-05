@@ -190,6 +190,19 @@ type EvalDetails struct {
 	state       interpreter.EvalState
 	costTracker *cost.Tracker
 	memTracker  *types.MemoryTracker
+	labels      []interpreter.Label
+}
+
+// Labels returns the data labels attached to the final evaluation result when data label
+// tracking is enabled via DataLabels. Returns nil otherwise.
+//
+// The labels reflect both the data dependencies and the control conditions that influenced the
+// selected result. The set is valid only for the evaluation that produced these details.
+func (ed *EvalDetails) Labels() []interpreter.Label {
+	if ed == nil {
+		return nil
+	}
+	return ed.labels
 }
 
 // State of the evaluation, non-nil if the OptTrackState or OptExhaustiveEval is specified
@@ -277,6 +290,9 @@ type prog struct {
 	asyncObserver             async.Observer
 	asyncCompletionBufferSize int
 	asyncMaxConcurrency       int
+
+	// labelConfig, when non-nil, enables per-evaluation data label tracking.
+	labelConfig *interpreter.LabelConfig
 }
 
 // scanOptTargets walks the AST once and reports whether the Optimize()
@@ -360,6 +376,13 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 	// Translate the EvalOption flags into InterpretableDecorator instances.
 	plannerOptions := make([]interpreter.PlannerOption, len(p.plannerOptions))
 	copy(plannerOptions, p.plannerOptions)
+
+	// Enable data label tracking before any other decorators so every planned node is wrapped
+	// for label propagation.
+	if p.labelConfig != nil {
+		plannerOptions = append(plannerOptions,
+			interpreter.LabelTracking(p.labelConfig, builtinOverloadIDs()))
+	}
 
 	// Enable interrupt checking if there's a non-zero check frequency
 	if p.interruptCheckFrequency > 0 {
@@ -485,9 +508,20 @@ func (p *prog) Eval(input any) (out ref.Val, det *EvalDetails, err error) {
 		}
 		mustClose = true
 	}
+	if p.labelConfig != nil && !frame.LabelConfigActive() {
+		if err = frame.InitLabels(p.labelConfig); err != nil {
+			return nil, nil, err
+		}
+	}
 	// Configure error recovery and details capture for evaluation.
 	defer func() {
 		det = captureCostTracker(det, frame)
+		if p.labelConfig != nil && frame.LabelConfigActive() {
+			if det == nil {
+				det = &EvalDetails{}
+			}
+			det.labels = frame.LabelResult(p.interpretable.ID())
+		}
 		if r := recover(); r != nil {
 			switch t := r.(type) {
 			case interpreter.EvalCancelledError:

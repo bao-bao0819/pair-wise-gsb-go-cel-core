@@ -66,6 +66,9 @@ type evalContext struct {
 
 	// observer for monitoring async calls.
 	observer AsyncObserver
+
+	// labels carries the per-evaluation data label tracker when label tracking is enabled.
+	labels *labelTracker
 }
 
 // ExecutionFrame provides the context for a single evaluation of an expression.
@@ -189,6 +192,7 @@ func (f *ExecutionFrame) Close() {
 		f.ctx.state = nil
 		f.ctx.costs = nil
 		f.ctx.memory = nil
+		f.ctx.labels = nil
 		f.ctx.interrupted.Store(false)
 		f.ctx.interruptCheckCount.Store(0)
 		f.ctx.interruptCheckFrequency = 0
@@ -384,6 +388,33 @@ func (f *ExecutionFrame) SetCostTracker(tracker *CostTracker) {
 	}
 	f.ctx.costs = tracker
 	f.costTracker = tracker
+}
+
+// InitLabels installs a fresh data label tracker for a single evaluation. The tracker is
+// discarded when the root frame is closed, so label state never escapes the evaluation or lands
+// on the shared Program / input objects.
+func (f *ExecutionFrame) InitLabels(cfg *LabelConfig) error {
+	if f.parent != nil {
+		return errors.New("InitLabels() called on child frame")
+	}
+	if f.ctx == nil {
+		f.ctx = evalContextPool.Get().(*evalContext)
+	}
+	f.ctx.labels = newLabelTracker(cfg)
+	return nil
+}
+
+// LabelResult returns the labels carried by the node that produced the given root result.
+func (f *ExecutionFrame) LabelResult(rootID int64) []Label {
+	if f.ctx == nil || f.ctx.labels == nil {
+		return nil
+	}
+	return f.ctx.labels.node(rootID)
+}
+
+// LabelConfigActive reports whether data label tracking is installed on this evaluation.
+func (f *ExecutionFrame) LabelConfigActive() bool {
+	return f.ctx != nil && f.ctx.labels != nil
 }
 
 // ComputeResult tracks and computes the result of the given asynchronous function.

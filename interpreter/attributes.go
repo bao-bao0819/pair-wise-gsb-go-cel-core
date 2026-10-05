@@ -553,7 +553,17 @@ func (a *conditionalAttribute) QualifyIfPresent(vars Activation, obj any, presen
 
 // Resolve evaluates the condition, and then resolves the truthy or falsy branch accordingly.
 func (a *conditionalAttribute) Resolve(vars Activation) (any, error) {
-	val := a.expr.Eval(vars)
+	var val ref.Val
+	if frame := findFrame(vars); frame != nil {
+		if tracker := trackerFromFrame(frame); tracker != nil {
+			if cached, isCached := tracker.condValue(a.expr.ID()); isCached {
+				val = cached
+			}
+		}
+	}
+	if val == nil {
+		val = a.expr.Eval(vars)
+	}
 	if val == types.True {
 		return a.truthy.Resolve(vars)
 	}
