@@ -9,6 +9,7 @@ go_library(
     srcs = [
         "cel.go",
         "decls.go",
+        "deprecation.go",
         "env.go",
         "fieldpaths.go",
         "folding.go",
@@ -29,6 +30,7 @@ go_library(
         "//cel/async:go_default_library",
         "//checker:go_default_library",
         "//checker/decls:go_default_library",
+        "//checker/deprecation:go_default_library",
         "//common:go_default_library",
         "//common/ast:go_default_library",
         "//common/containers:go_default_library",
@@ -68,6 +70,7 @@ go_test(
         "cost_test.go",
         "cost_k8s_test.go",
         "decls_test.go",
+        "deprecation_test.go",
         "env_ext_test.go",
         "env_test.go",
         "fieldpaths_test.go",
